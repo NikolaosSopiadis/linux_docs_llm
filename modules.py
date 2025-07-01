@@ -41,6 +41,9 @@ class SinusoidalPositionalEmbedding(nn.Module):
     """
     Fixed sinusoidal positional embedding (no learned parameters).
     """
+    # declare the buffer’s type so static checkers treat it as a Tensor
+    pos_emb: Tensor
+    
     def __init__(
         self,
         seq_length: int,

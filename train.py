@@ -11,7 +11,8 @@ import torch.nn as nn
 from datetime import datetime
 from pathlib import Path
 
-from transformers import T5TokenizerFast, get_cosine_schedule_with_warmup
+from transformers import BertTokenizerFast #, get_cosine_schedule_with_warmup
+from transformers.optimization import get_cosine_schedule_with_warmup
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -20,6 +21,8 @@ from network import TransformerLM
 from model import LMModule
 from dataset import MLMDataset
 
+# silence the “tokenizers parallelism” warnings
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a decoder-only Transformer MLM')
@@ -27,7 +30,7 @@ def parse_args():
     parser.add_argument('--train_dir', type=str, required=True, help='Directory of training text files')
     parser.add_argument('--eval_dir', type=str, required=True, help='Directory of eval text files')
     parser.add_argument('--seq_length', type=int, default=128)
-    parser.add_argument('--vocab_model', type=str, default='t5-small')
+    parser.add_argument('--vocab_model', type=str, default='bert-base-uncased')
     # Mask scheduling
     parser.add_argument('--initial_mask_rate', type=float, default=0.4, help='Starting mask rate')
     parser.add_argument('--final_mask_rate', type=float, default=0.15, help='Ending mask rate')
@@ -39,7 +42,7 @@ def parse_args():
     parser.add_argument('--ffn_size', type=int, default=2048)
     parser.add_argument('--dropout', type=float, default=0.1)
     # Training
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=96)
     parser.add_argument('--accumulate_steps', type=int, default=24)
     parser.add_argument('--max_epochs', type=int, default=5)
     parser.add_argument('--peak_lr', type=float, default=3e-4)
@@ -70,13 +73,20 @@ def main():
         json.dump(vars(args), f, indent=2)
 
     # Tokenizer
-    tokenizer = T5TokenizerFast.from_pretrained(args.vocab_model)
+    tokenizer = BertTokenizerFast.from_pretrained(
+        args.vocab_model,
+        model_max_length=args.seq_length * 1_000_000,  # avoid “sequence length” warnings
+        pad_to_max_length=False,
+    )
+    # sync our model size with the tokenizer’s vocab
+    args.vocab_size = tokenizer.vocab_size
 
     # Datasets with initial mask rate
     train_ds = MLMDataset(args.train_dir, tokenizer, args.seq_length, mask_rate=args.initial_mask_rate)
     eval_ds  = MLMDataset(args.eval_dir, tokenizer, args.seq_length, mask_rate=args.initial_mask_rate)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4)
     eval_loader  = DataLoader(eval_ds,  batch_size=args.batch_size, shuffle=False, num_workers=2)
+    print(f"Loaded {len(train_ds)} training samples and {len(eval_ds)} evaluation samples.")
 
     # Model
     network = TransformerLM(
@@ -97,12 +107,21 @@ def main():
     total_steps = (len(train_loader) * args.max_epochs) // args.accumulate_steps
     warmup_steps = int(args.warmup_ratio * total_steps)
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-
+    print(f"Training for {args.max_epochs} epochs ({total_steps} steps), warmup={warmup_steps} steps.")
+    
     # Training Loop
+    print("Beginning training loop...")
     global_step = 0
+    scaler = torch.GradScaler("cuda")
     for epoch in range(1, args.max_epochs + 1):
         # Update mask rate per epoch
-        mask_rate = args.initial_mask_rate + (args.final_mask_rate - args.initial_mask_rate) * ((epoch-1)/(args.max_epochs-1))
+        if args.max_epochs == 1:
+            mask_rate = args.final_mask_rate
+        else:
+            mask_rate = args.initial_mask_rate + (args.final_mask_rate - args.initial_mask_rate) * ((epoch-1)/(args.max_epochs-1))
+        train_ds.mask_rate = mask_rate
+        eval_ds.mask_rate  = mask_rate
+
         train_ds.mask_rate = mask_rate
         eval_ds.mask_rate = mask_rate
         print(f"Epoch {epoch} mask rate: {mask_rate:.3f}")
@@ -112,13 +131,17 @@ def main():
         optimizer.zero_grad()
         for step, (tokens, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}")):
             tokens, labels = tokens.to(device), labels.to(device)
-            loss = lm_module.get_loss(tokens, labels) / args.accumulate_steps
-            loss.backward()
+            # use mixed precision
+            with torch.autocast("cuda"):
+                loss = lm_module.get_loss(tokens, labels) / args.accumulate_steps
+            scaler.scale(loss).backward()
             running_loss += loss.item()
 
             if (step + 1) % args.accumulate_steps == 0:
+                scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(lm_module.parameters(), args.clip_grad_norm)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -147,6 +170,7 @@ def main():
                 val_loss += lm_module.get_loss(tokens, labels).item()
         val_loss /= len(eval_loader)
         val_ppl = float(torch.exp(torch.tensor(val_loss)))
+        print(f"Finished epoch {epoch}/{args.max_epochs}")
         print(f"Epoch {epoch} Validation Loss: {val_loss:.4f}, Perplexity: {val_ppl:.2f}")
 
     # Final model save

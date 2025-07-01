@@ -3,12 +3,12 @@
 
 import random
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
-from transformers import PreTrainedTokenizerFast
+from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 
 
 class MLMDataset(Dataset):
@@ -53,7 +53,7 @@ class MLMDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> (Tensor, Tensor):
+    def __getitem__(self, index: int) -> Tuple[Tensor, Tensor]:
         """
         Returns a pair (input_ids, labels) where:
         - input_ids has masked tokens according to `mask_rate` and
@@ -70,7 +70,8 @@ class MLMDataset(Dataset):
         for idx in mask_indices:
             prob = random.random()
             if prob < 0.8:
-                tokens[idx] = self.tokenizer.mask_token_id
+                # mask_token_id is actually an int at runtime so we can ignore typechecking
+                tokens[idx] = self.tokenizer.mask_token_id # type: ignore
             elif prob < 0.9:
                 tokens[idx] = random.randrange(self.tokenizer.vocab_size)
             # else: 10% keep original
