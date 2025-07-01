@@ -4,16 +4,16 @@ from multiprocessing import Pool
 from concurrent.futures import ThreadPoolExecutor
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
-SRC_ROOT    = "archwiki_text"                 # raw wikiextractor output
-DOCS_ROOT   = "filtered_docs"                 # where individual docs will go
-SPLIT_ROOT  = "split"                         # where train/val splits will be stored
-TRAIN_RATIO = 0.9                             # fraction of docs for training
-NUM_WORKERS = 8                               # number of parallel copy jobs
-SEED        = 42                              # for reproducibility
-
+SRC_ROOT     = "archwiki_text"                  # raw wikiextractor output
+DOCS_ROOT    = "filtered_docs"                  # where individual docs will go
+SPLIT_ROOT   = "split"                          # where train/val splits will be stored
+TRAIN_RATIO  = 0.9                              # fraction of docs for training
+NUM_WORKERS  = 8                                # number of parallel copy jobs
+SEED         = 42                               # for reproducibility
+MIN_DOC_SIZE = 1024                             # Minimum document size (bytes) to keep
 # ─── Patterns ─────────────────────────────────────────────────────────────────
 doc_pattern = re.compile(
-    r'<doc[^>]*id="(?P<id>\d+)"[^>]*title="(?P<title>[^"]+)"[^>]*>(?P<body>.*?)</doc>',
+        r'<doc[^>]*id="(?P<id>\d+)"[^>]*title="(?P<title>[^"]+)"[^>]*>(?P<body>.*?)</doc>',
     re.S
 )
 
@@ -36,6 +36,7 @@ def wrap_code_blocks(body_text: str) -> str:
     return "".join(out_lines)
 
 def extract_docs():
+    """Extract docs, filter non-English, drop small files, wrap code, write per-doc files."""
     os.makedirs(DOCS_ROOT, exist_ok=True)
     count = 0
     for sub in os.listdir(SRC_ROOT):
@@ -52,6 +53,9 @@ def extract_docs():
                 if "(" in title and ")" in title:
                     continue
                 wrapped = wrap_code_blocks(body)
+                # Skip very small docs
+                if len(wrapped.encode('utf-8')) < MIN_DOC_SIZE:
+                    continue
                 out = os.path.join(DOCS_ROOT, f"{doc_id}.txt")
                 with open(out, "w", encoding="utf-8") as o:
                     o.write(wrapped)
@@ -87,5 +91,3 @@ def split_and_copy():
 if __name__ == "__main__":
     extract_docs()
     split_and_copy()
-
-#TODO: delete blank files or files with only a few words
