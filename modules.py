@@ -67,16 +67,29 @@ class SinusoidalPositionalEmbedding(nn.Module):
         emb[:, 1::2] = torch.cos(position * div_term)
         return emb
 
+    # def forward(self, x: Tensor) -> Tensor:
+    #     """
+    #     Args:
+    #         x: Tensor of shape [batch_size, seq_length, hidden_size]
+    #     Returns:
+    #         pos_emb expanded to [batch_size, seq_length, hidden_size]
+    #     """
+    #     batch_size: int = x.size(0)
+    #     return self.pos_emb.unsqueeze(0).expand(batch_size, -1, -1)
+
     def forward(self, x: Tensor) -> Tensor:
         """
         Args:
-            x: Tensor of shape [batch_size, seq_length, hidden_size]
+            x: Tensor of shape [batch_size, seq_len, hidden_size]
         Returns:
-            pos_emb expanded to [batch_size, seq_length, hidden_size]
+            pos_emb: Tensor of shape [batch_size, seq_len, hidden_size]
         """
-        batch_size: int = x.size(0)
-        return self.pos_emb.unsqueeze(0).expand(batch_size, -1, -1)
-
+        batch_size, seq_len, _ = x.shape
+        # slice down to the actual sequence length
+        # self.pos_emb is [max_seq_length, hidden_size]
+        pos = self.pos_emb[:seq_len, :]           # [seq_len, H]
+        # broadcast to [batch_size, seq_len, H]
+        return pos.unsqueeze(0).expand(batch_size, seq_len, -1)
 
 class MultiHeadSelfAttention(nn.Module):
     """

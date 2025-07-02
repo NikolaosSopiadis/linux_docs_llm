@@ -83,13 +83,6 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Setup output directory and config
-    now = datetime.now().strftime('%Y%m%d_%H%M%S')
-    save_path = Path(args.save_dir) / now
-    save_path.mkdir(parents=True, exist_ok=True)
-    with open(save_path / 'config.json', 'w') as f:
-        json.dump(vars(args), f, indent=2)
-
     # Tokenizer
     tokenizer = BertTokenizerFast.from_pretrained(
         args.vocab_model,
@@ -98,6 +91,13 @@ def main():
     )
     # sync our model size with the tokenizer’s vocab
     args.vocab_size = tokenizer.vocab_size
+
+    # Setup output directory and config
+    now = datetime.now().strftime('%Y%m%d_%H%M%S')
+    save_path = Path(args.save_dir) / now
+    save_path.mkdir(parents=True, exist_ok=True)
+    with open(save_path / 'config.json', 'w') as f:
+        json.dump(vars(args), f, indent=2)
 
     # Datasets (streaming) with constant mask rate
     train_ds = StreamingMLMDataset(args.train_dir, tokenizer, args.seq_length, args.mask_rate)

@@ -65,15 +65,26 @@ class TransformerLM(nn.Module):
             logits: Tensor of shape [batch_size, seq_length, vocab_size]
         """
         batch_size, seq_len = input_ids.size()
-        assert seq_len == self.seq_length, f"Expected seq_length={self.seq_length}, got {seq_len}"
-        # build or reuse mask
-        causal_mask = build_causal_mask(self.seq_length, self.device)
+        B, seq_len = input_ids.shape
+        # allow any seq_len up to model max; error if it’s longer
+        if seq_len > self.seq_length:
+            raise ValueError(f"Input sequence length {seq_len} exceeds model max of {self.seq_length}")
+
+        # # build or reuse mask
+        # causal_mask = build_causal_mask(self.seq_length, self.device)
+        # build a causal mask exactly the size of our current sequence
+        causal_mask = build_causal_mask(seq_len, input_ids.device)
+        
         # embeddings
-        x: Tensor = self.token_embedding(input_ids)  # [B, S, H]
-        x = x + self.pos_embedding(x)  # [B, S, H]
+        # x: Tensor = self.token_embedding(input_ids)  # [B, S, H]
+        # x = x + self.pos_embedding(x)  # [B, S, H]
+        x = self.token_embedding(input_ids)       # [B, S, H]
+        x = x + self.pos_embedding(x)             # [B, S, H]
+
         # transformer blocks
         for layer in self.layers:
             x = layer(x, attn_mask=causal_mask)
+            
         # final layers
         x = self.norm(x)
         logits: Tensor = self.lm_head(x)
@@ -94,12 +105,20 @@ class TransformerLM(nn.Module):
         generated = input_ids
         for _ in range(max_length - generated.size(1)):
             seq_len = generated.size(1)
-            assert seq_len <= self.seq_length, "Generation length exceeds model context"
-            # pad to seq_length
-            pad_len = self.seq_length - seq_len
-            input_pad = nn.functional.pad(generated, (pad_len, 0), value=0)
-            logits = self.forward(input_pad)  # [B, S, V]
-            next_logits = logits[:, seq_len - 1, :]  # last position
+            # assert seq_len <= self.seq_length, "Generation length exceeds model context"
+            # # pad to seq_length
+            # pad_len = self.seq_length - seq_len
+            # input_pad = nn.functional.pad(generated, (pad_len, 0), value=0)
+            # logits = self.forward(input_pad)  # [B, S, V]
+            # next_logits = logits[:, seq_len - 1, :]  # last position
+
+
+            if seq_len > self.seq_length:
+                raise ValueError(f"Generation length {seq_len} > model context {self.seq_length}")
+            # Directly forward the growing sequence (now allowed ≤ seq_length)
+            logits = self.forward(generated)    # [B, seq_len, V]
+            next_logits = logits[:, -1, :]      # last position
+            
             next_tokens = torch.argmax(next_logits, dim=-1, keepdim=True)  # [B,1]
             generated = torch.cat([generated, next_tokens], dim=1)
             if eos_token_id is not None and (next_tokens == eos_token_id).all():

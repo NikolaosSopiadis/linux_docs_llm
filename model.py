@@ -56,32 +56,73 @@ class LMModule(nn.Module):
     def sample(
         self,
         input_ids: Tensor,
-        max_length: int = 64,
+        max_new_tokens: int = 64,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
         eos_token_id: Optional[int] = None,
     ) -> Tensor:
         """
-        Generate tokens autoregressively using the inner network's generate method.
+        Autoregressive sampling from the model.
 
         Args:
-            input_ids: [batch_size, cur_len]
-            max_length: total length including initial
-            eos_token_id: optional token id to stop on
+          input_ids: [B, S] starting tokens
+          max_new_tokens: how many tokens to generate
+          temperature: >0. Higher = more random. 1.0 = no scaling.
+          top_k: if set, only sample from the top_k logits each step
+          top_p: if set, use nucleus sampling: smallest set with cum-prob ≥ top_p
+          eos_token_id: if provided, stop when all batches have generated it
 
         Returns:
-            Tensor [batch_size, generated_len]
+          Tensor of shape [B, S+T] with the generated continuation appended.
         """
-        # delegate to network if it has generate
-        if hasattr(self.network, 'generate'):
-            return self.network.generate(input_ids=input_ids, max_length=max_length, eos_token_id=eos_token_id)  # type: ignore
-        # fallback greedy
+        B, S = input_ids.shape
+        device = input_ids.device
+        eos = eos_token_id if eos_token_id is not None else self.eos_token_id
+
         generated = input_ids
-        for _ in range(max_length - generated.size(1)):
-            logits = self.network(generated)
-            next_logits = logits[:, -1, :]
-            next_tokens = torch.argmax(next_logits, dim=-1, keepdim=True)
-            generated = torch.cat([generated, next_tokens], dim=1)
-            if eos_token_id is not None and (next_tokens == eos_token_id).all():
-                break
+        for _ in range(max_new_tokens):
+            # 1) forward pass
+            logits = self.network(generated)           # [B, S+t, V]
+            next_logits = logits[:, -1, :]            # [B, V]
+
+            # 2) apply temperature
+            next_logits = next_logits / temperature
+
+            # 3) top-k
+            if top_k is not None and top_k > 0:
+                values, indices = torch.topk(next_logits, top_k)
+                # mask out everything not in top_k
+                mask = next_logits < values[..., -1, None]
+                next_logits = next_logits.masked_fill(mask, -float('Inf'))
+
+            # 4) top-p (nucleus) sampling
+            if top_p is not None and 0.0 < top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                # mask tokens beyond cumulative top_p
+                sorted_mask = cumulative_probs > top_p
+                # shift mask right so we always keep at least one
+                sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+                sorted_mask[..., 0] = False
+
+                # scatter the mask back to original logits
+                mask = sorted_mask.scatter(-1, sorted_indices, sorted_mask)
+                next_logits = next_logits.masked_fill(mask, -float('Inf'))
+
+            # 5) sample
+            probs = F.softmax(next_logits, dim=-1)       # [B, V]
+            next_tokens = torch.multinomial(probs, num_samples=1)  # [B, 1]
+
+            # 6) append
+            generated = torch.cat([generated, next_tokens], dim=1)  # [B, S+t+1]
+
+            # 7) optional early stop
+            if eos is not None:
+                # if every batch has emitted eos at last position, stop.
+                if (next_tokens == eos).all():
+                    break
+
         return generated
 
     def save(self, file_path: str) -> None:
@@ -96,8 +137,28 @@ class LMModule(nn.Module):
     def load(self, file_path: str) -> None:
         """Load model state from file."""
         payload = torch.load(file_path, map_location='cpu')
-        state_dict = payload.get('model_state', payload)
-        self.network.load_state_dict(state_dict)
+        # pick out whichever key holds the raw weights
+        if 'model_state_dict' in payload:
+            raw_sd = payload['model_state_dict']
+        elif 'model_state' in payload:
+            raw_sd = payload['model_state']
+        elif 'state_dict' in payload:
+            raw_sd = payload['state_dict']
+        else:
+            raw_sd = payload
+
+        # strip any "_orig_mod." prefixes from keys
+        new_sd = {}
+        prefix = '_orig_mod.'
+        for k, v in raw_sd.items():
+            if k.startswith(prefix):
+                new_key = k[len(prefix):]
+            else:
+                new_key = k
+            new_sd[new_key] = v
+
+        # load into network
+        self.network.load_state_dict(new_sd)
         # restore tokenizer specials if present
         if 'pad_token_id' in payload:
             self.pad_token_id = payload['pad_token_id']  # type: ignore
