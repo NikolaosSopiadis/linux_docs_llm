@@ -41,8 +41,7 @@ def parse_args():
     parser.add_argument('--seq_length', type=int, default=128)
     parser.add_argument('--vocab_model', type=str, default='bert-base-uncased')
     # Mask scheduling
-    parser.add_argument('--initial_mask_rate', type=float, default=0.4, help='Starting mask rate')
-    parser.add_argument('--final_mask_rate', type=float, default=0.15, help='Ending mask rate')
+    parser.add_argument('--mask_rate', type=float, default=0.15)
     # Model
     parser.add_argument('--vocab_size', type=int, default=32128)
     parser.add_argument('--hidden_size', type=int, default=512)
@@ -56,16 +55,20 @@ def parse_args():
     parser.add_argument('--accumulate_steps', type=int, default=24)
     parser.add_argument('--max_epochs', type=int, default=5)
     parser.add_argument('--peak_lr', type=float, default=3e-4)
+    parser.add_argument('--beta1', type=float, default=0.9)
+    parser.add_argument('--beta2', type=float, default=0.98)
+    parser.add_argument('--eps', type=float, default=1e-12)
     parser.add_argument('--warmup_ratio', type=float, default=0.1)
-    parser.add_argument('--weight_decay', type=float, default=0.05)
+    parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--clip_grad_norm', type=float, default=0.5)
-    parser.add_argument('--log_interval', type=int, default=100)
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--steps_per_epoch', type=int, default=51104)
-    parser.add_argument("--eval_steps", type=int, default=5576,
-    help="If set, limits validation to this many batches per epoch")
+    parser.add_argument("--eval_steps", type=int, default=5576)
+    parser.add_argument(
+        "--acc_steps_start",type=int, default=21)
+    parser.add_argument("--acc_steps_end", type=int, default=85)
 
     return parser.parse_args()
 
@@ -96,19 +99,9 @@ def main():
     # sync our model size with the tokenizer’s vocab
     args.vocab_size = tokenizer.vocab_size
 
-    # Datasets (streaming) with initial mask rate
-    # train_ds = StreamingMLMDataset(
-    #     args.train_dir, tokenizer,
-    #     args.seq_length, args.initial_mask_rate,
-    #     args.batch_size, args.num_workers
-    # )
-    # eval_ds = StreamingMLMDataset(
-    #     args.eval_dir, tokenizer,
-    #     args.seq_length, args.initial_mask_rate,
-    #     args.batch_size, args.num_workers
-    # )
-    train_ds = StreamingMLMDataset(args.train_dir, tokenizer, args.seq_length, args.initial_mask_rate)
-    eval_ds  = StreamingMLMDataset(args.eval_dir,  tokenizer, args.seq_length, args.initial_mask_rate)
+    # Datasets (streaming) with constant mask rate
+    train_ds = StreamingMLMDataset(args.train_dir, tokenizer, args.seq_length, args.mask_rate)
+    eval_ds  = StreamingMLMDataset(args.eval_dir,  tokenizer, args.seq_length, args.mask_rate)
 
     loader_args = dict(
         batch_size=args.batch_size,
@@ -148,7 +141,7 @@ def main():
     
     # Optimizer & Scheduler
     optimizer = torch.optim.AdamW(
-        lm_module.parameters(), lr=args.peak_lr, weight_decay=args.weight_decay
+        lm_module.parameters(), lr=args.peak_lr, weight_decay=args.weight_decay, betas=(args.beta1, args.beta2), eps=args.eps
     )
     # total_steps = (len(train_loader) * args.max_epochs) // args.accumulate_steps
     # warmup_steps = int(args.warmup_ratio * total_steps)
@@ -190,17 +183,15 @@ def main():
 
     print("Beginning training loop...")
     for epoch in range(1, args.max_epochs + 1):
-        # Update mask rate per epoch
+        print(f"Epoch {epoch}")
+        
+        # linearly ramp acc_steps over epochs
         if args.max_epochs == 1:
-            mask_rate = args.final_mask_rate
+            acc_steps = args.acc_steps_end
         else:
-            mask_rate = args.initial_mask_rate + (args.final_mask_rate - args.initial_mask_rate) * ((epoch-1)/(args.max_epochs-1))
-        train_ds.mask_rate = mask_rate
-        eval_ds.mask_rate  = mask_rate
-
-        train_ds.mask_rate = mask_rate
-        eval_ds.mask_rate = mask_rate
-        print(f"Epoch {epoch} mask rate: {mask_rate:.3f}")
+            frac = (epoch - 1) / (args.max_epochs - 1)
+            acc_steps = int(args.acc_steps_start + (args.acc_steps_end - args.acc_steps_start) * frac)
+        print(f"Accumulating {acc_steps} micro-batches per update (total batch ~{acc_steps*args.batch_size})")
 
         lm_module.train()
         running_loss = 0.0
@@ -212,11 +203,11 @@ def main():
             labels = labels.to(device, non_blocking=True)
             # use mixed precision
             with torch.autocast("cuda"):
-                loss = lm_module.get_loss(tokens, labels) / args.accumulate_steps
+                loss = lm_module.get_loss(tokens, labels) / acc_steps
             scaler.scale(loss).backward()
             running_loss += loss.item()
 
-            if (step + 1) % args.accumulate_steps == 0:
+            if step % acc_steps == 0:
                 # pbar.set_postfix_str(f"global_step={global_step}")                
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(lm_module.parameters(), args.clip_grad_norm)
@@ -225,21 +216,6 @@ def main():
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
-
-                # if global_step % args.log_interval == 0:
-                #     avg_loss = running_loss / args.log_interval
-                #     current_lr = scheduler.get_last_lr()[0]
-                #     print(f"Step {global_step}, LR: {current_lr:.3e}, Loss: {avg_loss:.4f}")
-                #     running_loss = 0.0
-                #     # Save checkpoint
-                #     ckpt = {
-                #         'epoch': epoch,
-                #         'global_step': global_step,
-                #         'model_state': lm_module.network.state_dict(),
-                #         'optimizer_state': optimizer.state_dict(),
-                #         'scheduler_state': scheduler.state_dict(),
-                #     }
-                #     torch.save(ckpt, save_path / f'checkpoint_step{global_step}.pt')
 
         # Validation
         lm_module.eval()
@@ -288,7 +264,6 @@ def main():
             'model_state_dict': lm_module.network.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
-            'mask_rate': mask_rate,
         }
         torch.save(ckpt, save_path / f'checkpoint_epoch{epoch}.pt')
         print(f"Saved checkpoint_epoch{epoch}.pt")
@@ -304,5 +279,6 @@ def main():
 if __name__ == '__main__':
     main()
 
+# Using mixed precision produced no performance gains
 # Using torch optimizations like kernel parameters and jit compiling the network: From ~3.3 it/s To ~3.7 it/s
 # Dropping q/k/v biases: From ~3.7 it/s to ~4.1 it/s
