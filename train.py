@@ -55,7 +55,7 @@ def parse_args():
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=4)
-
+    parser.add_argument('--steps_per_epoch', type=int, default=51104)
     return parser.parse_args()
 
 
@@ -86,27 +86,29 @@ def main():
     args.vocab_size = tokenizer.vocab_size
 
     # Datasets (streaming) with initial mask rate
-    train_ds = StreamingMLMDataset(
-        args.train_dir, tokenizer,
-        args.seq_length, args.initial_mask_rate,
-        args.batch_size, args.num_workers
-    )
-    eval_ds = StreamingMLMDataset(
-        args.eval_dir, tokenizer,
-        args.seq_length, args.initial_mask_rate,
-        args.batch_size, args.num_workers
-    )
+    # train_ds = StreamingMLMDataset(
+    #     args.train_dir, tokenizer,
+    #     args.seq_length, args.initial_mask_rate,
+    #     args.batch_size, args.num_workers
+    # )
+    # eval_ds = StreamingMLMDataset(
+    #     args.eval_dir, tokenizer,
+    #     args.seq_length, args.initial_mask_rate,
+    #     args.batch_size, args.num_workers
+    # )
+    train_ds = StreamingMLMDataset(args.train_dir, tokenizer, args.seq_length, args.initial_mask_rate)
+    eval_ds  = StreamingMLMDataset(args.eval_dir,  tokenizer, args.seq_length, args.initial_mask_rate)
 
-    # DataLoaders: batch_size=None because datapipes already batch
+
     train_loader = DataLoader(
         train_ds,
-        batch_size=None,
+        batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers
     )
     eval_loader = DataLoader(
         eval_ds,
-        batch_size=None,
+        batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers
     )
@@ -127,8 +129,25 @@ def main():
     optimizer = torch.optim.AdamW(
         lm_module.parameters(), lr=args.peak_lr, weight_decay=args.weight_decay
     )
-    total_steps = (len(train_loader) * args.max_epochs) // args.accumulate_steps
+    # total_steps = (len(train_loader) * args.max_epochs) // args.accumulate_steps
+    # warmup_steps = int(args.warmup_ratio * total_steps)
+    
+    if args.steps_per_epoch is not None:
+        steps_per_epoch = args.steps_per_epoch
+    else:
+        # If train_loader has __len__, use it; otherwise error out
+        try:
+            steps_per_epoch = len(train_loader)
+        except TypeError:
+            raise RuntimeError(
+                "train_loader has no length. Please pass --steps_per_epoch when "
+                "using an IterableDataset."
+            )
+
+    # Total optimizer steps across all epochs (after accumulation)
+    total_steps = (steps_per_epoch * args.max_epochs) // args.accumulate_steps
     warmup_steps = int(args.warmup_ratio * total_steps)
+    
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
     print(f"Training for {args.max_epochs} epochs ({total_steps} steps), warmup={warmup_steps} steps.")
     
