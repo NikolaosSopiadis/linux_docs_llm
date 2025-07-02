@@ -54,6 +54,8 @@ def parse_args():
     parser.add_argument('--log_interval', type=int, default=100)
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--num_workers', type=int, default=4)
+
     return parser.parse_args()
 
 
@@ -99,11 +101,13 @@ def main():
     train_loader = DataLoader(
         train_ds,
         batch_size=None,
+        shuffle=False,
         num_workers=args.num_workers
     )
     eval_loader = DataLoader(
         eval_ds,
         batch_size=None,
+        shuffle=False,
         num_workers=args.num_workers
     )
 
