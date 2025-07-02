@@ -174,7 +174,8 @@ def main():
         lm_module.train()
         running_loss = 0.0
         optimizer.zero_grad()
-        for step, (tokens, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}")):
+        pbar = tqdm(train_loader, total=steps_per_epoch, desc=f"Epoch {epoch}")
+        for step, (tokens, labels) in enumerate(pbar, start=1):
             tokens, labels = tokens.to(device), labels.to(device)
             # use mixed precision
             with torch.autocast("cuda"):
@@ -183,6 +184,7 @@ def main():
             running_loss += loss.item()
 
             if (step + 1) % args.accumulate_steps == 0:
+                pbar.set_postfix_str(f"global_step={global_step}")                
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(lm_module.parameters(), args.clip_grad_norm)
                 scaler.step(optimizer)
