@@ -26,6 +26,11 @@ from dataset import StreamingMLMDataset
 # silence the “tokenizers parallelism” warnings
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
+# kernel tuning for incrased performance 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a decoder-only Transformer MLM')
     # Data
@@ -99,18 +104,24 @@ def main():
     train_ds = StreamingMLMDataset(args.train_dir, tokenizer, args.seq_length, args.initial_mask_rate)
     eval_ds  = StreamingMLMDataset(args.eval_dir,  tokenizer, args.seq_length, args.initial_mask_rate)
 
+    loader_args = dict(
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        # possible performance incrase
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True,
+        drop_last=True
+    )
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers
+        **loader_args
     )
     eval_loader = DataLoader(
         eval_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers
+        **loader_args
     )
 
     # Model
@@ -123,8 +134,12 @@ def main():
         ffn_size=args.ffn_size,
         dropout=args.dropout,
     ).to(device)
-    lm_module = LMModule(network, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id).to(device)
+    # use jit to increase performance
+    if torch.__version__ >= "2.0":
+        network = torch.compile(network)
 
+    lm_module = LMModule(network, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id).to(device)
+    
     # Optimizer & Scheduler
     optimizer = torch.optim.AdamW(
         lm_module.parameters(), lr=args.peak_lr, weight_decay=args.weight_decay
@@ -176,7 +191,9 @@ def main():
         optimizer.zero_grad()
         pbar = tqdm(train_loader, total=steps_per_epoch, desc=f"Epoch {epoch}")
         for step, (tokens, labels) in enumerate(pbar, start=1):
-            tokens, labels = tokens.to(device), labels.to(device)
+            # tokens, labels = tokens.to(device), labels.to(device)
+            tokens = tokens.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             # use mixed precision
             with torch.autocast("cuda"):
                 loss = lm_module.get_loss(tokens, labels) / args.accumulate_steps
@@ -251,3 +268,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# Using torch optimizations like kernel parameters and jit compiling the network: From ~3.3 it/s To ~3.7 it/s
+# Dropping q/k/v biases: From ~3.7 it/s to ~4.1 it/s

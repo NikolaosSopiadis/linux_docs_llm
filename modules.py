@@ -94,15 +94,14 @@ class MultiHeadSelfAttention(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
+            bias = False
         )
         self.initialize()
 
     def initialize(self) -> None:
         # initialize in_proj and out_proj
         init.xavier_uniform_(self.attn.in_proj_weight)
-        init.zeros_(self.attn.in_proj_bias)
         init.xavier_uniform_(self.attn.out_proj.weight)
-        init.zeros_(self.attn.out_proj.bias)
 
     def forward(
         self,
