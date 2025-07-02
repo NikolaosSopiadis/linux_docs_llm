@@ -8,8 +8,10 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
+from typing import List
 from datetime import datetime
 from pathlib import Path
+import matplotlib.pyplot as plt
 
 from transformers import BertTokenizerFast #, get_cosine_schedule_with_warmup
 from transformers.optimization import get_cosine_schedule_with_warmup
@@ -19,7 +21,7 @@ from tqdm import tqdm
 from modules import TokenEmbedding, SinusoidalPositionalEmbedding, TransformerBlock
 from network import TransformerLM
 from model import LMModule
-from dataset import MLMDataset
+from dataset import StreamingMLMDataset
 
 # silence the “tokenizers parallelism” warnings
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -81,12 +83,29 @@ def main():
     # sync our model size with the tokenizer’s vocab
     args.vocab_size = tokenizer.vocab_size
 
-    # Datasets with initial mask rate
-    train_ds = MLMDataset(args.train_dir, tokenizer, args.seq_length, mask_rate=args.initial_mask_rate)
-    eval_ds  = MLMDataset(args.eval_dir, tokenizer, args.seq_length, mask_rate=args.initial_mask_rate)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    eval_loader  = DataLoader(eval_ds,  batch_size=args.batch_size, shuffle=False, num_workers=2)
-    print(f"Loaded {len(train_ds)} training samples and {len(eval_ds)} evaluation samples.")
+    # Datasets (streaming) with initial mask rate
+    train_ds = StreamingMLMDataset(
+        args.train_dir, tokenizer,
+        args.seq_length, args.initial_mask_rate,
+        args.batch_size, args.num_workers
+    )
+    eval_ds = StreamingMLMDataset(
+        args.eval_dir, tokenizer,
+        args.seq_length, args.initial_mask_rate,
+        args.batch_size, args.num_workers
+    )
+
+    # DataLoaders: batch_size=None because datapipes already batch
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=None,
+        num_workers=args.num_workers
+    )
+    eval_loader = DataLoader(
+        eval_ds,
+        batch_size=None,
+        num_workers=args.num_workers
+    )
 
     # Model
     network = TransformerLM(
@@ -110,9 +129,12 @@ def main():
     print(f"Training for {args.max_epochs} epochs ({total_steps} steps), warmup={warmup_steps} steps.")
     
     # Training Loop
-    print("Beginning training loop...")
     global_step = 0
+    val_losses: List[float] = []
+    val_ppls:   List[float] = []
     scaler = torch.GradScaler("cuda")
+
+    print("Beginning training loop...")
     for epoch in range(1, args.max_epochs + 1):
         # Update mask rate per epoch
         if args.max_epochs == 1:
@@ -146,20 +168,20 @@ def main():
                 optimizer.zero_grad()
                 global_step += 1
 
-                if global_step % args.log_interval == 0:
-                    avg_loss = running_loss / args.log_interval
-                    current_lr = scheduler.get_last_lr()[0]
-                    print(f"Step {global_step}, LR: {current_lr:.3e}, Loss: {avg_loss:.4f}")
-                    running_loss = 0.0
-                    # Save checkpoint
-                    ckpt = {
-                        'epoch': epoch,
-                        'global_step': global_step,
-                        'model_state': lm_module.network.state_dict(),
-                        'optimizer_state': optimizer.state_dict(),
-                        'scheduler_state': scheduler.state_dict(),
-                    }
-                    torch.save(ckpt, save_path / f'checkpoint_step{global_step}.pt')
+                # if global_step % args.log_interval == 0:
+                #     avg_loss = running_loss / args.log_interval
+                #     current_lr = scheduler.get_last_lr()[0]
+                #     print(f"Step {global_step}, LR: {current_lr:.3e}, Loss: {avg_loss:.4f}")
+                #     running_loss = 0.0
+                #     # Save checkpoint
+                #     ckpt = {
+                #         'epoch': epoch,
+                #         'global_step': global_step,
+                #         'model_state': lm_module.network.state_dict(),
+                #         'optimizer_state': optimizer.state_dict(),
+                #         'scheduler_state': scheduler.state_dict(),
+                #     }
+                #     torch.save(ckpt, save_path / f'checkpoint_step{global_step}.pt')
 
         # Validation
         lm_module.eval()
@@ -170,6 +192,30 @@ def main():
                 val_loss += lm_module.get_loss(tokens, labels).item()
         val_loss /= len(eval_loader)
         val_ppl = float(torch.exp(torch.tensor(val_loss)))
+        val_losses.append(val_loss)
+        val_ppls.append(val_ppl)
+        epochs = list(range(1, epoch + 1))    
+
+        # Plot validation loss curve
+        plt.figure()
+        plt.plot(epochs, val_losses, marker='o')
+        plt.title('Validation Loss per Epoch')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        plt.savefig(save_path / 'val_loss_per_epoch.png')
+        plt.close()
+
+        # Plot perplexity curve
+        plt.figure()
+        plt.plot(epochs, val_ppls, marker='o')
+        plt.title('Validation Perplexity per Epoch')
+        plt.xlabel('Epoch')
+        plt.ylabel('Perplexity')
+        plt.grid(True)
+        plt.savefig(save_path / 'val_ppl_per_epoch.png')
+        plt.close()
+        
         print(f"Finished epoch {epoch}/{args.max_epochs}")
         print(f"Epoch {epoch} Validation Loss: {val_loss:.4f}, Perplexity: {val_ppl:.2f}")
 
