@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import random
+import itertools
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,6 +16,7 @@ import matplotlib.pyplot as plt
 
 from transformers import BertTokenizerFast #, get_cosine_schedule_with_warmup
 from transformers.optimization import get_cosine_schedule_with_warmup
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -48,6 +50,7 @@ def parse_args():
     parser.add_argument('--num_heads', type=int, default=8)
     parser.add_argument('--ffn_size', type=int, default=2048)
     parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--onecycle', type=bool, default=True)
     # Training
     parser.add_argument('--batch_size', type=int, default=96)
     parser.add_argument('--accumulate_steps', type=int, default=24)
@@ -61,6 +64,9 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--steps_per_epoch', type=int, default=51104)
+    parser.add_argument("--eval_steps", type=int, default=5576,
+    help="If set, limits validation to this many batches per epoch")
+
     return parser.parse_args()
 
 
@@ -163,7 +169,17 @@ def main():
     total_steps = (steps_per_epoch * args.max_epochs) // args.accumulate_steps
     warmup_steps = int(args.warmup_ratio * total_steps)
     
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    if args.onecycle:
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=args.peak_lr,
+            total_steps=total_steps,
+            pct_start=warmup_steps / total_steps,
+            anneal_strategy="cos",
+            cycle_momentum=False
+        )
+    else:
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
     print(f"Training for {args.max_epochs} epochs ({total_steps} steps), warmup={warmup_steps} steps.")
     
     # Training Loop
@@ -201,7 +217,7 @@ def main():
             running_loss += loss.item()
 
             if (step + 1) % args.accumulate_steps == 0:
-                pbar.set_postfix_str(f"global_step={global_step}")                
+                # pbar.set_postfix_str(f"global_step={global_step}")                
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(lm_module.parameters(), args.clip_grad_norm)
                 scaler.step(optimizer)
@@ -228,11 +244,19 @@ def main():
         # Validation
         lm_module.eval()
         val_loss = 0.0
+        n_val_batches = 0
+        val_iter = eval_loader
+        if args.eval_steps:
+            val_iter = itertools.islice(eval_loader, args.eval_steps)
+
         with torch.no_grad():
-            for tokens, labels in eval_loader:
-                tokens, labels = tokens.to(device), labels.to(device)
+            for tokens, labels in tqdm(val_iter, total=args.eval_steps or None, desc="Validation"):
+                # tokens, labels = tokens.to(device), labels.to(device)
+                tokens = tokens.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
                 val_loss += lm_module.get_loss(tokens, labels).item()
-        val_loss /= len(eval_loader)
+                n_val_batches += 1
+        val_loss /= n_val_batches
         val_ppl = float(torch.exp(torch.tensor(val_loss)))
         val_losses.append(val_loss)
         val_ppls.append(val_ppl)
@@ -257,12 +281,23 @@ def main():
         plt.grid(True)
         plt.savefig(save_path / 'val_ppl_per_epoch.png')
         plt.close()
+
+        ckpt = {
+            'epoch': epoch,
+            'global_step': global_step,
+            'model_state_dict': lm_module.network.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'mask_rate': mask_rate,
+        }
+        torch.save(ckpt, save_path / f'checkpoint_epoch{epoch}.pt')
+        print(f"Saved checkpoint_epoch{epoch}.pt")
         
         print(f"Finished epoch {epoch}/{args.max_epochs}")
         print(f"Epoch {epoch} Validation Loss: {val_loss:.4f}, Perplexity: {val_ppl:.2f}")
 
     # Final model save
-    torch.save(lm_module.network.state_dict(), save_path / 'final_model.pt')
+    # torch.save(lm_module.network.state_dict(), save_path / 'final_model.pt')
     print("Training complete.")
 
 
