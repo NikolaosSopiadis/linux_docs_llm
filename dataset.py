@@ -20,7 +20,7 @@ class StreamingMLMDataset(IterableDataset):
         data_dir: str,
         tokenizer: PreTrainedTokenizerFast,
         seq_length: int,
-        mask_rate: float = 0.15,
+        mask_rate: float = 0.25,
     ):
         super().__init__()
         self.files = list(Path(data_dir).glob("*.txt"))
@@ -64,45 +64,26 @@ class StreamingMLMDataset(IterableDataset):
                         seq = buffer_ids[i*self.seq_length : (i+1)*self.seq_length]
                         tokens = torch.tensor(seq, dtype=torch.long)
                         labels = tokens.clone()
-                        # ... apply your 80/10/10 masking to `tokens` ...
+                        
+                        # 80/10/10 dynamic masking:
+                        #  - mask_rate of positions selected for masking
+                        #  - 80% replaced with [MASK], 10% random, 10% unchanged
+                        mask_indices = torch.rand(self.seq_length) < self.mask_rate
+                        mask_token = self.tokenizer.mask_token_id
+
+                        # For tokens *not* masked, set label = -100 so they're ignored in loss
+                        labels[~mask_indices] = -100
+
+                        # Apply masking to selected positions
+                        for idx in torch.nonzero(mask_indices, as_tuple=False).view(-1).tolist():
+                            prob = random.random()
+                            if prob < 0.8:
+                                tokens[idx] = mask_token  # type: ignore
+                            elif prob < 0.9:
+                                tokens[idx] = random.randrange(self.tokenizer.vocab_size)
+                            # else: leave the token unchanged 
+                        
                         yield tokens, labels
 
                     # drop the emitted tokens, keep the remainder
                     buffer_ids = buffer_ids[n*self.seq_length :]
-
-        # for file_path in per_worker:
-        #     text = file_path.read_text(encoding="utf-8", errors="ignore")
-
-        #     # Tokenize entire file once
-        #     token_ids = self.tokenizer.encode(
-        #         text,
-        #         add_special_tokens=False,
-        #         truncation=False,
-        #     )
-
-        #     # Make chunk start indices: 0, seq_length, 2*seq_length, …
-        #     n_tokens = len(token_ids)
-        #     if n_tokens < self.seq_length:
-        #         continue
-        #     starts = list(range(0, n_tokens - self.seq_length + 1, self.seq_length))
-        #     random.shuffle(starts)
-
-        #     for st in starts:
-        #         chunk = token_ids[st : st + self.seq_length]
-        #         tokens = torch.tensor(chunk, dtype=torch.long)
-        #         labels = tokens.clone()
-
-        #         # Dynamic masking 80/10/10:
-        #         mask_indices = torch.rand(self.seq_length) < self.mask_rate
-        #         mask_token = self.tokenizer.mask_token_id
-        #         for i in torch.nonzero(mask_indices, as_tuple=False).view(-1).tolist():
-        #             p = random.random()
-        #             if p < 0.8:
-        #                 # mask_token is actually an int at runtime so we can ignore typechecker
-        #                 tokens[i] = mask_token # type: ignore
-        #             elif p < 0.9:
-        #                 tokens[i] = random.randrange(self.tokenizer.vocab_size)
-        #             # else 10% leave unchanged
-
-        #         yield tokens, labels
-        
