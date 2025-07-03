@@ -6,6 +6,7 @@ import json
 import os
 import random
 import itertools
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -44,10 +45,10 @@ def parse_args():
     parser.add_argument('--mask_rate', type=float, default=0.15)
     # Model
     parser.add_argument('--vocab_size', type=int, default=32128)
-    parser.add_argument('--hidden_size', type=int, default=512)
+    parser.add_argument('--hidden_size', type=int, default=256)
     parser.add_argument('--num_layers', type=int, default=6)
-    parser.add_argument('--num_heads', type=int, default=8)
-    parser.add_argument('--ffn_size', type=int, default=2048)
+    parser.add_argument('--num_heads', type=int, default=4)
+    parser.add_argument('--ffn_size', type=int, default=1024)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--onecycle', type=bool, default=True)
     # Training
@@ -64,13 +65,25 @@ def parse_args():
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--steps_per_epoch', type=int, default=51104)
-    parser.add_argument("--eval_steps", type=int, default=5576)
+    parser.add_argument('--steps_per_epoch', type=int, default=3951)
+    parser.add_argument("--eval_steps", type=int, default=438)
     parser.add_argument(
         "--acc_steps_start",type=int, default=21)
     parser.add_argument("--acc_steps_end", type=int, default=85)
 
     return parser.parse_args()
+
+def topk_accuracy(
+    logits: torch.Tensor,    # [N, V]
+    labels: torch.Tensor,    # [N]
+    k: int
+) -> float:
+    """
+    Fraction of positions where the true label is in the top-k logits.
+    """
+    topk = torch.topk(logits, k, dim=-1).indices   # [N, k]
+    hits = (topk == labels.unsqueeze(-1)).any(dim=-1)
+    return hits.float().mean().item()
 
 
 def main():
@@ -179,6 +192,9 @@ def main():
     global_step = 0
     val_losses: List[float] = []
     val_ppls:   List[float] = []
+    val_accs:   List[float] = []   
+    val_top5:   List[float] = []   
+    lr_history: List[float] = []   
     scaler = torch.GradScaler("cuda")
 
     print("Beginning training loop...")
@@ -216,11 +232,19 @@ def main():
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
+                
+        last_lr = scheduler.get_last_lr()[0]
+        lr_history.append(last_lr)  
 
         # Validation
         lm_module.eval()
-        val_loss = 0.0
+        val_loss_sum = 0.0
         n_val_batches = 0
+        
+        # For acc/topk we’ll collect only the masked positions
+        all_logits = []
+        all_labels = []
+        
         val_iter = eval_loader
         if args.eval_steps:
             val_iter = itertools.islice(eval_loader, args.eval_steps)
@@ -230,12 +254,43 @@ def main():
                 # tokens, labels = tokens.to(device), labels.to(device)
                 tokens = tokens.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
-                val_loss += lm_module.get_loss(tokens, labels).item()
+                
+                logits = lm_module.network(tokens)              # [B, S, V]
+                loss  = torch.nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                    ignore_index=-100
+                )
+                val_loss_sum += loss.item()
+                # val_loss += lm_module.get_loss(tokens, labels).item()
                 n_val_batches += 1
-        val_loss /= n_val_batches
-        val_ppl = float(torch.exp(torch.tensor(val_loss)))
+                
+                # collect masked positions
+                mask = labels.view(-1) != -100                 # [B*S]
+                flat_logits = logits.view(-1, logits.size(-1))[mask]  # [N_masked, V]
+                flat_labels = labels.view(-1)[mask]            # [N_masked]
+
+                all_logits.append(flat_logits)
+                all_labels.append(flat_labels)
+                
+        # aggregate
+        # val_loss /= n_val_batches
+        # val_ppl = float(torch.exp(torch.tensor(val_loss)))
+        val_loss = val_loss_sum / n_val_batches if n_val_batches else float("nan")
+        val_ppl  = math.exp(val_loss)
+
+        logits_cat = torch.cat(all_logits, dim=0)    # [TotalMask, V]
+        labels_cat = torch.cat(all_labels, dim=0)    # [TotalMask]
+
+        acc    = (logits_cat.argmax(-1) == labels_cat).float().mean().item()
+        top5   = topk_accuracy(logits_cat, labels_cat, k=5)
+
+        # save metrics
         val_losses.append(val_loss)
         val_ppls.append(val_ppl)
+        val_accs.append(acc)                         # ← ADDED
+        val_top5.append(top5)                        # ← ADDED
+
         epochs = list(range(1, epoch + 1))    
 
         # Plot validation loss curve
@@ -258,6 +313,26 @@ def main():
         plt.savefig(save_path / 'val_ppl_per_epoch.png')
         plt.close()
 
+        # Plot validation accuracy per epoch
+        plt.figure()
+        plt.plot(range(1, epoch+1), val_accs, marker='o')
+        plt.title('Validation Masked-Token Accuracy per Epoch')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.grid(True)
+        plt.savefig(save_path / 'val_acc_per_epoch.png')
+        plt.close()
+
+        # Plot top-5 accuracy per epoch
+        plt.figure()
+        plt.plot(range(1, epoch+1), val_top5, marker='o')
+        plt.title('Validation Top-5 Accuracy per Epoch')
+        plt.xlabel('Epoch')
+        plt.ylabel('Top-5 Accuracy')
+        plt.grid(True)
+        plt.savefig(save_path / 'val_top5_per_epoch.png')
+        plt.close()
+
         ckpt = {
             'epoch': epoch,
             'global_step': global_step,
@@ -269,7 +344,10 @@ def main():
         print(f"Saved checkpoint_epoch{epoch}.pt")
         
         print(f"Finished epoch {epoch}/{args.max_epochs}")
-        print(f"Epoch {epoch} Validation Loss: {val_loss:.4f}, Perplexity: {val_ppl:.2f}")
+        # print(f"Epoch {epoch} Validation Loss: {val_loss:.4f}, Perplexity: {val_ppl:.2f}")
+        print(f"Epoch {epoch} Validation Loss: {val_loss:.4f}, PPL: {val_ppl:.2f}, "
+              f"Acc: {acc:.3f}, Top-5: {top5:.3f}, LR: {last_lr:.2e}")
+
 
     # Final model save
     # torch.save(lm_module.network.state_dict(), save_path / 'final_model.pt')
