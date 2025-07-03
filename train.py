@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument('--seq_length', type=int, default=128)
     parser.add_argument('--vocab_model', type=str, default='bert-base-uncased')
     # Mask scheduling
-    parser.add_argument('--mask_rate', type=float, default=0.15)
+    parser.add_argument('--mask_rate', type=float, default=0.25)
     # Model
     parser.add_argument('--vocab_size', type=int, default=32128)
     parser.add_argument('--hidden_size', type=int, default=256)
@@ -241,9 +241,9 @@ def main():
         val_loss_sum = 0.0
         n_val_batches = 0
         
-        # For acc/topk we’ll collect only the masked positions
-        all_logits = []
-        all_labels = []
+        total_masked = 0
+        correct1 = 0
+        correct5 = 0
         
         val_iter = eval_loader
         if args.eval_steps:
@@ -253,43 +253,59 @@ def main():
             for tokens, labels in tqdm(val_iter, total=args.eval_steps or None, desc="Validation"):
                 # tokens, labels = tokens.to(device), labels.to(device)
                 tokens = tokens.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True) # [B, S]
                 
+                # forward once
                 logits = lm_module.network(tokens)              # [B, S, V]
+                B, S, V = logits.shape
+                
+                # compute loss
                 loss  = torch.nn.functional.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
+                    logits.view(-1, V),
                     labels.view(-1),
                     ignore_index=-100
                 )
                 val_loss_sum += loss.item()
                 # val_loss += lm_module.get_loss(tokens, labels).item()
                 n_val_batches += 1
-                
-                # collect masked positions
-                mask = labels.view(-1) != -100                 # [B*S]
-                flat_logits = logits.view(-1, logits.size(-1))[mask]  # [N_masked, V]
-                flat_labels = labels.view(-1)[mask]            # [N_masked]
+                        
+                # top-1 predictions
+                preds = logits.argmax(-1)                    # [B, S]
 
-                all_logits.append(flat_logits)
-                all_labels.append(flat_labels)
-                
+                # top-5 predictions
+                top5 = logits.topk(5, dim=-1).indices        # [B, S, 5]
+
+                # mask and count
+                mask = labels != -100                        # [B, S]
+                n_masked = mask.sum().item()
+                if n_masked == 0:
+                    continue
+
+                correct1 += (preds[mask] == labels[mask]).sum().item()
+
+                # for each masked position, did true label appear in top-5?
+                correct5 += (
+                    (top5[mask] == labels[mask].unsqueeze(-1))
+                    .any(dim=-1)
+                    .sum()
+                    .item()
+                )
+
+                total_masked += n_masked
+                        
         # aggregate
         # val_loss /= n_val_batches
         # val_ppl = float(torch.exp(torch.tensor(val_loss)))
         val_loss = val_loss_sum / n_val_batches if n_val_batches else float("nan")
         val_ppl  = math.exp(val_loss)
-
-        logits_cat = torch.cat(all_logits, dim=0)    # [TotalMask, V]
-        labels_cat = torch.cat(all_labels, dim=0)    # [TotalMask]
-
-        acc    = (logits_cat.argmax(-1) == labels_cat).float().mean().item()
-        top5   = topk_accuracy(logits_cat, labels_cat, k=5)
+        acc1     = correct1 / total_masked
+        acc5     = correct5 / total_masked
 
         # save metrics
         val_losses.append(val_loss)
         val_ppls.append(val_ppl)
-        val_accs.append(acc)                         # ← ADDED
-        val_top5.append(top5)                        # ← ADDED
+        val_accs.append(acc1)                         
+        val_top5.append(acc5)                        
 
         epochs = list(range(1, epoch + 1))    
 
@@ -346,7 +362,7 @@ def main():
         print(f"Finished epoch {epoch}/{args.max_epochs}")
         # print(f"Epoch {epoch} Validation Loss: {val_loss:.4f}, Perplexity: {val_ppl:.2f}")
         print(f"Epoch {epoch} Validation Loss: {val_loss:.4f}, PPL: {val_ppl:.2f}, "
-              f"Acc: {acc:.3f}, Top-5: {top5:.3f}, LR: {last_lr:.2e}")
+              f"Acc: {acc1:.3f}, Top-5: {acc5:.3f}, LR: {last_lr:.2e}")
 
 
     # Final model save
