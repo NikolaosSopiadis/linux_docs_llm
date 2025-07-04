@@ -1,5 +1,4 @@
 # network.py
-# Definition of the full decoder-only Transformer network for MLM
 
 from typing import Optional, List
 

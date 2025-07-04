@@ -65,7 +65,7 @@ class StreamingMLMDataset(IterableDataset):
                         tokens = torch.tensor(seq, dtype=torch.long)
                         labels = tokens.clone()
                         
-                        # 80/10/10 dynamic masking:
+                        # 80/10/10 dynamic mJonas Geipingasking:
                         #  - mask_rate of positions selected for masking
                         #  - 80% replaced with [MASK], 10% random, 10% unchanged
                         mask_indices = torch.rand(self.seq_length) < self.mask_rate
@@ -87,3 +87,4 @@ class StreamingMLMDataset(IterableDataset):
 
                     # drop the emitted tokens, keep the remainder
                     buffer_ids = buffer_ids[n*self.seq_length :]
+https://github.com/NikolaosSopiadis/linux_docs_llm

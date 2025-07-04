@@ -1,5 +1,4 @@
 # train.py
-# End-to-end training script for small-scale decoder-only Transformer MLM with mask-rate scheduling and eval metrics
 
 import argparse
 import json
@@ -45,31 +44,31 @@ def parse_args():
     parser.add_argument('--mask_rate', type=float, default=0.25)
     # Model
     parser.add_argument('--vocab_size', type=int, default=32128)
-    parser.add_argument('--hidden_size', type=int, default=256)
+    parser.add_argument('--hidden_size', type=int, default=512)
     parser.add_argument('--num_layers', type=int, default=6)
     parser.add_argument('--num_heads', type=int, default=4)
-    parser.add_argument('--ffn_size', type=int, default=1024)
-    parser.add_argument('--dropout', type=float, default=0.1)
-    parser.add_argument('--onecycle', type=bool, default=True)
+    parser.add_argument('--ffn_size', type=int, default=2048)
+    parser.add_argument('--dropout', type=float, default=0.05)
+    parser.add_argument('--onecycle', type=bool, default=False)
     # Training
     parser.add_argument('--batch_size', type=int, default=96)
     parser.add_argument('--accumulate_steps', type=int, default=24)
-    parser.add_argument('--max_epochs', type=int, default=5)
-    parser.add_argument('--peak_lr', type=float, default=3e-4)
+    parser.add_argument('--max_epochs', type=int, default=20)
+    parser.add_argument('--peak_lr', type=float, default=1e-3)
     parser.add_argument('--beta1', type=float, default=0.9)
     parser.add_argument('--beta2', type=float, default=0.98)
     parser.add_argument('--eps', type=float, default=1e-12)
     parser.add_argument('--warmup_ratio', type=float, default=0.1)
     parser.add_argument('--weight_decay', type=float, default=0.01)
-    parser.add_argument('--clip_grad_norm', type=float, default=0.5)
+    parser.add_argument('--clip_grad_norm_start', type=float, default=1.5)
+    parser.add_argument('--clip_grad_norm_end', type=float, default=0.5)
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--steps_per_epoch', type=int, default=3951)
     parser.add_argument("--eval_steps", type=int, default=438)
-    parser.add_argument(
-        "--acc_steps_start",type=int, default=21)
-    parser.add_argument("--acc_steps_end", type=int, default=85)
+    parser.add_argument("--acc_steps_start",type=int, default=10)
+    parser.add_argument("--acc_steps_end", type=int, default=40)
 
     return parser.parse_args()
 
@@ -226,7 +225,12 @@ def main():
             if step % acc_steps == 0:
                 # pbar.set_postfix_str(f"global_step={global_step}")                
                 scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(lm_module.parameters(), args.clip_grad_norm)
+                # linearly decrease gradient norm threshold
+                start_clip = args.clip_grad_norm_start
+                end_clip   = args.clip_grad_norm_end
+                frac       = (epoch - 1)/(args.max_epochs - 1)
+                clip_val   = start_clip + frac*(end_clip - start_clip)
+                nn.utils.clip_grad_norm_(lm_module.parameters(), clip_val)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()

@@ -1,5 +1,4 @@
 # model.py
-# Helper class wrapping the Transformer LM with training and utility methods
 
 from typing import Optional, Dict, Any
 import torch
